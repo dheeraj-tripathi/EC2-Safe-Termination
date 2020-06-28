@@ -1,0 +1,83 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ec2Describe",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeInstances"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ssm",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:UpdateInstanceInformation",
+                "ssm:UpdateInstanceAssociationStatus",
+                "ssm:UpdateAssociationStatus",
+                "ssm:ListInstanceAssociations",
+                "ssm:ListAssociations",
+                "ssm:GetParameters",
+                "ssm:GetDocument",
+                "ssm:GetCommandInvocation",
+                "ssm:DescribeDocument",
+                "ssm:DescribeAssociation"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ssmSend",
+            "Effect": "Allow",
+            "Action": "ssm:SendCommand",
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Sid": "s3Access",
+            "Effect": "Allow",
+            "Action": [ 
+            			"s3:GetObject",
+            			"s3:PutObject",
+            			"s3:ListBucket"
+            		],
+            "Resource": [
+                "*"
+            ]
+        },
+        {
+            "Sid": "ssmMessages",
+            "Effect": "Allow",
+            "Action": [
+                "ssmmessages:OpenDataChannel",
+                "ssmmessages:OpenControlChannel",
+                "ssmmessages:CreateDataChannel",
+                "ssmmessages:CreateControlChannel"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ec2MessagesforSSM",
+            "Effect": "Allow",
+            "Action": [
+                "ec2messages:SendReply",
+                "ec2messages:GetMessages",
+                "ec2messages:GetEndpoint",
+                "ec2messages:FailMessage",
+                "ec2messages:DeleteMessage",
+                "ec2messages:AcknowledgeMessage"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "UpdateASGLifecycleHookStatus",
+            "Effect": "Allow",
+            "Action": [
+                "autoscaling:CompleteLifecycleAction",
+                "autoscaling:DescribeAutoScalingGroups"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

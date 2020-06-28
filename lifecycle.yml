@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ec2 instance monirtoring alert(start/stop/terminate)
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Prerequisites
+        Parameters:
+          - IsCloudTrailEnabled
+    ParameterLabels:
+      IsCloudTrailEnabled:
+        default: >-
+          Is CloudTrail already enabled in this region? CloudTrail is a
+          requirement for Cloudwatch Events. If not enabled, please enable
+          CloudTrail before proceeding.
+Parameters:
+  IsCloudTrailEnabled:
+    Description: Specify if CloudTrail is enabled in the current region
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+  HeartBeatTimeOut:
+    Description: ASG Lifecycle Hook heartBeat Timeout
+    Type: Number
+    Default: 900
+    MinValue: 30
+    MaxValue: 7200
+Conditions:
+  CreateResources: !Equals 
+    - !Ref IsCloudTrailEnabled
+    - 'Yes'
+
+Resources:
+
+    ssmOutputBucket:
+      Type: AWS::S3::Bucket
+      Properties: 
+        BucketEncryption: 
+          ServerSideEncryptionConfiguration: 
+            - ServerSideEncryptionByDefault: 
+                SSEAlgorithm: AES256
+
+    snsASGLifecycleTerminationSNS:
+      Type: AWS::SNS::Topic
+      Condition: CreateResources
+      Properties: 
+        DisplayName: 'EC2 Lifecycle Termination Notifications'
+        Subscription: 
+          - Endpoint: !GetAtt 
+              - RunSSMonEC2Lambda
+              - Arn
+            Protocol: "Lambda"
+        TopicName: EC2TerminateLifecycle
+
+    AutoscalingSetLifecycleHook:
+      Type: 'AWS::Events::Rule'
+      Condition: CreateResources
+      Properties:
+        Description: Set ASG EC2 Termination Lifecycle Hook
+        EventPattern:
+          source:
+            - "aws.autoscaling"
+          detail-type:
+            - AWS API Call via CloudTrail
+          detail:
+            eventSource:
+              - "autoscaling.amazonaws.com"
+            eventName:
+              - CreateAutoScalingGroup
+        Name: SetASGLifecycleTerminateRule
+        State: ENABLED
+        Targets: 
+          - Arn: !GetAtt 
+              - SetASGLifecycleHookLambda
+              - Arn
+            Id: Production
+
+    RunSSMLambdaPermission:
+      Type: 'AWS::Lambda::Permission'
+      Properties:
+        FunctionName: !Ref RunSSMonEC2Lambda
+        Action: 'lambda:InvokeFunction'
+        Principal: sns.amazonaws.com
+        SourceArn: !Ref snsASGLifecycleTerminationSNS
+
+    RunSSMLambdaRole:
+      Type: 'AWS::IAM::Role'
+      Condition: CreateResources
+      Properties:
+        ManagedPolicyArns: 
+          - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+                  - autoscaling.amazonaws.com
+                  - ec2.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Policies:
+          - PolicyName: run_ssm_via_lambda_policy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Sid: cloudTrailAccess
+                  Effect: Allow
+                  Action:
+                    - 'cloudtrail:LookupEvents'
+                  Resource:
+                    - '*'
+                - Sid: CWLogsAccess
+                  Effect: Allow
+                  Action:
+                    - 'sns:Publish'
+                    - 'ec2:Describe*'
+                    - 'logs:CreateLogGroup'
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                    - 'iam:PassRole'
+                    - 'ssm:SendCommand'
+                    - 's3:ListAllMyBuckets'
+                    - 's3:PutObject'
+                    - 's3:ListBucket'
+                    - 's3:GetObject'
+                  Resource:
+                    - '*'
+
+    RunSSMonEC2Lambda:
+      Type: 'AWS::Lambda::Function'
+      Condition: CreateResources
+      Properties:
+        Code:
+          ZipFile: |
+            import boto3
+            import os 
+            import time
+            import json
+
+            def lambda_handler(event, context):
+                
+                print("Triggered event details\n", event)
+                asg_data = json.loads(event['Records'][0]['Sns']['Message'])
+                region = os.environ['AWS_REGION']
+                
+                if 'EC2InstanceId' not in asg_data:
+                    print('Test event auto triggered by ASG, while setting up hook for first time, not an ec2 termiante event')
+                    return
+                
+                else:
+                    instance_id = asg_data['EC2InstanceId']
+                    ssm_command_timeout = int(os.environ['ssm_command_timeout'])
+                    ssm_cmd1 = os.environ['ssm_cmd1']
+                    ssm_cmd2 = os.environ['ssm_cmd2']
+                    ssm_cmd3 = os.environ['ssm_cmd3'] 
+
+                    print("Attempting to run SSM command on instance_id", instance_id)
+                    
+                    ssm_client = boto3.client('ssm', region_name=region)
+                    cmd_response = ssm_client.send_command(
+                        InstanceIds=[
+                            instance_id,
+                        ],
+                        DocumentName='AWS-RunShellScript',
+                        TimeoutSeconds=ssm_command_timeout,
+                        Comment='SSM-Run-Command-EC2-Terminate-LifecycleHook',
+                        Parameters={
+                            "commands": [   ssm_cmd1,
+                                            ssm_cmd2,
+                                            ssm_cmd3
+                                         ],
+                            "executionTimeout": ['900']
+                        },
+                        OutputS3Region=region,
+                        OutputS3BucketName=os.environ['s3_bucket'],
+                        OutputS3KeyPrefix='SSM-Run-Command-EC2-Terminate-LifecycleHook'
+                    )  
+                    print("ssm command run id - ", cmd_response['Command']['CommandId'])
+                    print("SSM command run response \n", cmd_response)
+        Description: Lambda function for running pre-termination script on EC2 instance before termination
+        Handler: index.lambda_handler
+        Environment:
+          Variables:
+            ssm_command_timeout: !Ref HeartBeatTimeOut
+            ssm_cmd1: !Join
+            - ''
+            - - 'aws s3 cp s3://'
+              - !Ref ssmOutputBucket
+              - '/pre_termination_tasks.sh'
+              - '  '
+              - '/tmp/pre_termination_tasks.sh'
+            ssm_cmd2: 'chmod 755 /tmp/pre_termination_tasks.sh'
+            ssm_cmd3: 'sudo sh /tmp/pre_termination_tasks.sh'
+            s3_bucket: !Ref ssmOutputBucket
+        Role: !GetAtt 
+          - RunSSMLambdaRole
+          - Arn
+        Runtime: python3.6
+        Timeout: '900'
+
+##################################################
+
+    SetLifecycleHookLambdaPermission:
+      Type: 'AWS::Lambda::Permission'
+      Properties:
+        FunctionName: !Ref SetASGLifecycleHookLambda
+        Action: 'lambda:InvokeFunction'
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt 
+          - AutoscalingSetLifecycleHook
+          - Arn
+
+    EC2SetLifecycleHookIAMRole:
+      Type: 'AWS::IAM::Role'
+      Condition: CreateResources
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+                  - autoscaling.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Policies:
+          - PolicyName: set_asg_termination_lifecycle_hook_policy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Sid: cloudtrailAccess
+                  Effect: Allow
+                  Action:
+                    - 'cloudtrail:LookupEvents'
+                  Resource:
+                    - '*'
+                - Sid: CWLogsAccess
+                  Effect: Allow
+                  Action:
+                    - 'sns:Publish'
+                    - 'ec2:Describe*'
+                    - 'logs:CreateLogGroup'
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                    - 'autoscaling:DescribeAutoScalingGroups'
+                    - 'autoscaling:PutLifecycleHook'
+                    - 'autoscaling:UpdateAutoScalingGroup'
+                    - 'autoscaling:PutNotificationConfiguration'
+                    - 'autoscaling:RecordLifecycleActionHeartbeat'
+                    - 'iam:PassRole'
+                    
+                  Resource:
+                    - '*'
+
+    SetASGLifecycleHookLambda:
+      Type: 'AWS::Lambda::Function'
+      Condition: CreateResources
+      Properties:
+        Code:
+          ZipFile: |
+            import boto3
+            import json
+            import os
+
+            def lambda_handler(event, context):
+              print("Invoked event details\n",event)
+              asg_name = event['detail']['requestParameters']['autoScalingGroupName']
+              region = event['region']
+              asg_lifecycle_role = os.environ['asg_lifecycle_role']
+              sns_arn = os.environ['sns_arn']
+              heartbeat_timeout = int(os.environ['heartbeat_timeout'])
+              
+              # Setup Terminate EC2 Lifecycle Hook
+              
+              asg_client = boto3.client('autoscaling', region_name=region)
+              response = asg_client.put_lifecycle_hook(
+                LifecycleHookName='EC2_Terminate_Lifecycle_Hook',
+                AutoScalingGroupName=asg_name,
+                LifecycleTransition='autoscaling:EC2_INSTANCE_TERMINATING',
+                RoleARN=asg_lifecycle_role,
+                NotificationTargetARN=sns_arn,
+                NotificationMetadata='EC2 Instance termination lifecycle hook triggered',
+                HeartbeatTimeout=heartbeat_timeout,
+                DefaultResult='CONTINUE'
+                    )
+              print("Set Lifecycle hook response\n", response)
+
+        Description: Lambda function to setup ASG EC2 termination Lifecycle Hook
+        Handler: index.lambda_handler
+        Environment:
+          Variables:
+            sns_arn: !Ref snsASGLifecycleTerminationSNS
+            asg_lifecycle_role: !GetAtt
+              - LifecycleHookIAMRole
+              - Arn
+            heartbeat_timeout: !Ref HeartBeatTimeOut
+        Role: !GetAtt 
+          - EC2SetLifecycleHookIAMRole
+          - Arn
+        Runtime: python3.6
+        Timeout: '900'
+
+############## ASG Lifecycle Hook Rule ###################
+
+    LifecycleHookIAMRole:
+      Type: 'AWS::IAM::Role'
+      Condition: CreateResources
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - autoscaling.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Policies:
+          - PolicyName: asg_lifecycle_hook_asg_policy
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Sid: snsNotificatiion
+                  Effect: Allow
+                  Action:
+                    - 'sqs:GetQueueUrl'
+                    - 'sns:Publish'
+                    - 'sqs:SendMessage'
+                  Resource:
+                    - '*'
+Outputs:
+
+  ssmOutputBucket:
+    Description: S3 Bucket which contains the pre termination task script and SSM output of command run
+    Value: !GetAtt ssmOutputBucket.Arn
+
+  snsASGLifecycleTerminationSNS:
+    Description: SNS Topic used as trigger to ASG Lifecycle event to kick off Lambda
+    Value: !GetAtt snsASGLifecycleTerminationSNS.TopicName
+
+  AutoscalingSetLifecycleHook:
+    Description: AWS Cloudwatch event rule that triggers lambda to setup ASG lifecycle hook
+    Value: !GetAtt AutoscalingSetLifecycleHook.Arn
+
+  EC2SetLifecycleHookIAMRole:
+    Description: Lambda IAM role that setup ASG lifecycle hook
+    Value: !GetAtt EC2SetLifecycleHookIAMRole.Arn
+
+  LifecycleHookIAMRole:
+    Description: Lifecycle hook IAM Role used by autoscaling group
+    Value: !GetAtt LifecycleHookIAMRole.Arn
+
+  SetASGLifecycleHookLambda:
+    Description: Lambda that sets up ASG lifecycle hook whenver a new ASG is created
+    Value: !GetAtt SetASGLifecycleHookLambda.Arn
+
+  RunSSMonEC2Lambda:
+    Description: Run SSM on EC2 instanes before termination
+    Value: !GetAtt RunSSMonEC2Lambda.Arn
